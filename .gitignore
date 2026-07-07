@@ -27,3 +27,4 @@ rustc-ice-*.txt
 .DS_Store
 .mimocode/
 docs/compose
+.reasonix/

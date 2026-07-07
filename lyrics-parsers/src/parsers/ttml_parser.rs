@@ -15,6 +15,12 @@ struct Agent {
     agent_type: String,
 }
 
+#[derive(Clone)]
+struct TranslationValue {
+    text: String,
+    span_texts: Vec<String>,
+}
+
 enum XmlNode {
     Element {
         name: String,
@@ -179,18 +185,18 @@ pub fn parse(ttml: &str) -> LyricsData {
             if let Some(tmap) = translations.get(key_val) {
                 let replacement = tmap
                     .iter()
-                    .find(|((t, _), v)| t.eq_ignore_ascii_case("replacement") && !v.trim().is_empty())
-                    .map(|(_, v)| v.clone());
+                    .find(|((t, _), v)| t.eq_ignore_ascii_case("replacement") && !v.text.trim().is_empty())
+                    .map(|(_, v)| v);
 
                 if let Some(rep) = replacement {
-                    line = apply_replacement(line, &rep);
+                    line = apply_replacement(line, rep);
                     line.set_alignment(align);
                 }
 
                 let subtitles: Vec<_> = tmap
                     .iter()
                     .filter(|((t, _), _)| t.eq_ignore_ascii_case("subtitle"))
-                    .map(|((_, lang), val)| (lang.clone(), val.clone()))
+                    .map(|((_, lang), val)| (lang.clone(), val.text.clone()))
                     .collect();
 
                 if !subtitles.is_empty() {
@@ -428,7 +434,12 @@ fn get_alignment_from_agent(agent_id: &Option<String>, agents: &[Agent]) -> Lyri
 }
 
 fn parse_itunes_metadata(doc: &[XmlNode], data: &mut LyricsData) {
-    let meta = match find_first_element(doc, "iTunesMetadata") {
+    let metadata = find_first_element(doc, "metadata");
+    let meta = find_first_element(doc, "iTunesMetadata");
+
+    parse_track_metadata(doc, metadata, meta, data);
+
+    let meta = match meta {
         Some(m) => m,
         None => return,
     };
@@ -465,8 +476,249 @@ fn parse_itunes_metadata(doc: &[XmlNode], data: &mut LyricsData) {
     }
 }
 
-fn parse_translations(doc: &[XmlNode]) -> HashMap<String, HashMap<(String, String), String>> {
-    let mut result: HashMap<String, HashMap<(String, String), String>> = HashMap::new();
+static METADATA_KEY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[^A-Za-z0-9]").unwrap());
+
+fn parse_track_metadata(
+    doc: &[XmlNode],
+    metadata: Option<&XmlNode>,
+    itunes_metadata: Option<&XmlNode>,
+    data: &mut LyricsData,
+) {
+    let track = data.track_metadata.get_or_insert_with(TrackMetadata::new);
+
+    let mut roots: Vec<&XmlNode> = Vec::new();
+    if let Some(m) = itunes_metadata {
+        roots.push(m);
+    }
+    if let Some(m) = metadata {
+        roots.push(m);
+    }
+    for node in doc {
+        roots.push(node);
+    }
+
+    set_if_empty(
+        &mut track.title,
+        find_metadata_value(&roots, &["title", "trackTitle", "songTitle", "songName", "musicName"]),
+    );
+    set_if_empty(
+        &mut track.artist,
+        find_metadata_value(
+            &roots,
+            &["artist", "artists", "artistName", "songArtist", "singer", "performer", "performers"],
+        ),
+    );
+    set_if_empty(
+        &mut track.album,
+        find_metadata_value(&roots, &["album", "albumName"]),
+    );
+    set_if_empty(
+        &mut track.album_artist,
+        find_metadata_value(&roots, &["albumArtist", "albumArtistName"]),
+    );
+    set_if_empty(
+        &mut track.isrc,
+        find_metadata_value(&roots, &["isrc"]),
+    );
+
+    if track.duration_ms.is_none() {
+        let body_dur = find_elements(doc, "body")
+            .iter()
+            .find_map(|b| {
+                if let XmlNode::Element { attributes, .. } = b {
+                    attr_value(attributes, "dur")
+                } else {
+                    None
+                }
+            });
+
+        let duration = body_dur
+            .as_deref()
+            .and_then(parse_time_ms)
+            .or_else(|| parse_metadata_duration(&roots));
+        if let Some(d) = duration {
+            track.duration_ms = Some(d);
+        }
+    }
+
+    let root_lang = doc.first().and_then(|n| {
+        if let XmlNode::Element { attributes, .. } = n {
+            attr_value(attributes, "lang")
+        } else {
+            None
+        }
+    });
+
+    let simplified_replacement_lang = find_elements(doc, "translation")
+        .iter()
+        .find(|node| {
+            if let XmlNode::Element { attributes, .. } = node {
+                let typ = attr_value(attributes, "type").unwrap_or_default();
+                typ.trim().eq_ignore_ascii_case("replacement")
+            } else {
+                false
+            }
+        })
+        .and_then(|node| {
+            if let XmlNode::Element { attributes, .. } = node {
+                attr_value(attributes, "lang")
+            } else {
+                None
+            }
+        })
+        .filter(|x| {
+            is_language(root_lang.as_deref(), "zh-Hant") && is_language(Some(x), "zh-Hans")
+        });
+
+    if simplified_replacement_lang.is_some() {
+        track.language = Some(vec!["zh-Hans".to_string()]);
+    } else if let Some(ref rl) = root_lang {
+        let trimmed = rl.trim().to_string();
+        if !trimmed.is_empty() {
+            track.language = Some(vec![trimmed]);
+        }
+    }
+}
+
+fn set_if_empty(target: &mut Option<String>, new_value: Option<String>) {
+    if target.as_ref().is_none_or(|v| v.trim().is_empty()) {
+        if let Some(v) = new_value {
+            let trimmed = v.trim().to_string();
+            if !trimmed.is_empty() {
+                *target = Some(trimmed);
+            }
+        }
+    }
+}
+
+fn find_metadata_value(roots: &[&XmlNode], keys: &[&str]) -> Option<String> {
+    let normalized_keys: std::collections::HashSet<String> = keys
+        .iter()
+        .map(|k| normalize_metadata_key(k))
+        .collect();
+
+    for root in roots {
+        for element in descendants_and_self(root) {
+            if let XmlNode::Element {
+                name,
+                attributes,
+                children,
+            } = element
+            {
+                for (attr_name, attr_val) in attributes.iter() {
+                    if !attr_val.trim().is_empty()
+                        && normalized_keys.contains(&normalize_metadata_key(attr_name))
+                    {
+                        return Some(attr_val.trim().to_string());
+                    }
+                }
+
+                let key = get_metadata_key(attributes);
+                if let Some(ref k) = key {
+                    if !k.trim().is_empty() && normalized_keys.contains(&normalize_metadata_key(k)) {
+                        let value = get_metadata_value(attributes, children);
+                        if let Some(ref v) = value {
+                            if !v.trim().is_empty() {
+                                return Some(v.trim().to_string());
+                            }
+                        }
+                    }
+                }
+
+                if normalized_keys.contains(&normalize_metadata_key(name)) {
+                    let value = get_element_own_text(children);
+                    if !value.trim().is_empty() {
+                        return Some(value.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn descendants_and_self(node: &XmlNode) -> Vec<&XmlNode> {
+    let mut result = vec![node];
+    if let XmlNode::Element { children, .. } = node {
+        for child in children {
+            result.extend(descendants_and_self(child));
+        }
+    }
+    result
+}
+
+fn parse_metadata_duration(roots: &[&XmlNode]) -> Option<i32> {
+    for key in &["durationMs", "durationInMillis", "duration", "length"] {
+        let value = find_metadata_value(roots, &[key])?;
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if let Ok(int_val) = trimmed.parse::<i32>() {
+            if key.contains("Ms") || key.contains("Millis") || int_val > 10000 {
+                return Some(int_val);
+            }
+        }
+
+        if let Some(ms) = parse_time_ms(trimmed) {
+            return Some(ms);
+        }
+    }
+    None
+}
+
+fn get_metadata_key(attrs: &[(String, String)]) -> Option<String> {
+    attr_value(attrs, "key")
+        .or_else(|| attr_value(attrs, "name"))
+        .or_else(|| attr_value(attrs, "property"))
+}
+
+fn get_metadata_value(attrs: &[(String, String)], children: &[XmlNode]) -> Option<String> {
+    attr_value(attrs, "value")
+        .or_else(|| attr_value(attrs, "content"))
+        .or_else(|| {
+            let text = get_element_own_text(children);
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        })
+}
+
+fn get_element_own_text(nodes: &[XmlNode]) -> String {
+    nodes
+        .iter()
+        .filter_map(|n| {
+            if let XmlNode::Text(t) = n {
+                Some(t.as_str())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<&str>>()
+        .concat()
+}
+
+fn normalize_metadata_key(key: &str) -> String {
+    METADATA_KEY_RE.replace_all(key, "").to_string()
+}
+
+fn is_language(lang: Option<&str>, language_prefix: &str) -> bool {
+    let lang = match lang {
+        Some(l) if !l.trim().is_empty() => l.trim(),
+        _ => return false,
+    };
+    lang.eq_ignore_ascii_case(language_prefix)
+        || lang
+            .to_lowercase()
+            .starts_with(&format!("{}-", language_prefix).to_lowercase())
+}
+
+fn parse_translations(doc: &[XmlNode]) -> HashMap<String, HashMap<(String, String), TranslationValue>> {
+    let mut result: HashMap<String, HashMap<(String, String), TranslationValue>> = HashMap::new();
 
     let translation_nodes = find_elements(doc, "translation");
     for node in translation_nodes {
@@ -508,7 +760,10 @@ fn parse_translations(doc: &[XmlNode]) -> HashMap<String, HashMap<(String, Strin
                 result
                     .entry(key)
                     .or_default()
-                    .insert((typ.clone(), lang.clone()), value);
+                    .insert((typ.clone(), lang.clone()), TranslationValue {
+                        text: value,
+                        span_texts: extract_timed_span_texts(children),
+                    });
             }
         }
     }
@@ -546,27 +801,104 @@ fn normalize_bracket_inner_spacing_for_bg(syllables: &mut [SyllableInfo]) {
     last.text = CLOSE_BRACKET_SPACE_RE.replace_all(&last.text, "$1").to_string();
 }
 
-fn apply_replacement(mut line: LineInfo, replacement: &str) -> LineInfo {
-    let replacement = normalize_text(replacement);
+fn extract_timed_span_texts(nodes: &[XmlNode]) -> Vec<String> {
+    nodes
+        .iter()
+        .filter_map(|node| {
+            if let XmlNode::Element {
+                name,
+                attributes,
+                children,
+            } = node
+            {
+                if local_name(name) == "span"
+                    && attr_value(attributes, "begin").is_some_and(|b| !b.trim().is_empty())
+                {
+                    let text = normalize_text(&element_text_value(children));
+                    if !text.is_empty() {
+                        return Some(text);
+                    }
+                }
+            }
+            None
+        })
+        .collect()
+}
+
+fn replace_syllable_line_parts(
+    syllables: &[SyllableInfo],
+    new_parts: &[String],
+) -> Option<Vec<SyllableInfo>> {
+    if new_parts.is_empty() || new_parts.len() != syllables.len() {
+        return None;
+    }
+
+    let new_syllables: Vec<SyllableInfo> = syllables
+        .iter()
+        .zip(new_parts.iter())
+        .map(|(syllable, new_part)| {
+            let leading: String =
+                syllable.text.chars().take_while(|c| c.is_whitespace()).collect();
+            let trailing: String = syllable
+                .text
+                .chars()
+                .rev()
+                .take_while(|c| c.is_whitespace())
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            let replacement = normalize_text(new_part);
+            SyllableInfo::new(
+                format!("{}{}{}", leading, replacement, trailing),
+                syllable.start_time,
+                syllable.end_time,
+            )
+        })
+        .collect();
+
+    Some(new_syllables)
+}
+
+fn apply_replacement(mut line: LineInfo, replacement: &TranslationValue) -> LineInfo {
+    let replacement_text = normalize_text(&replacement.text);
     let existing_sub = line.sub_line().cloned();
 
     let (main_replacement, bg_replacement) = if existing_sub.is_some() {
-        let (main_text, bracket) = split_first_bracket_segment(&replacement);
+        let (main_text, bracket) = split_first_bracket_segment(&replacement_text);
         let bg = bracket.map(|b| normalize_bracket_outer_spaces(&b));
         (main_text, bg)
     } else {
-        (normalize_spaces(&replacement), None)
+        (normalize_spaces(&replacement_text), None)
     };
 
     match &mut line {
         LineInfo::Syllable { syllables, .. } => {
-            replace_syllable_line_text(syllables, &main_replacement);
+            let new_sylls = if existing_sub.is_none() {
+                replace_syllable_line_parts(syllables, &replacement.span_texts)
+            } else {
+                None
+            };
+            if let Some(new_sylls) = new_sylls {
+                *syllables = new_sylls;
+            } else {
+                replace_syllable_line_text(syllables, &main_replacement);
+            }
         }
         LineInfo::Line { text, .. } => {
             *text = normalize_text(&main_replacement);
         }
         LineInfo::FullSyllable { syllables, .. } => {
-            replace_syllable_line_text(syllables, &main_replacement);
+            let new_sylls = if existing_sub.is_none() {
+                replace_syllable_line_parts(syllables, &replacement.span_texts)
+            } else {
+                None
+            };
+            if let Some(new_sylls) = new_sylls {
+                *syllables = new_sylls;
+            } else {
+                replace_syllable_line_text(syllables, &main_replacement);
+            }
         }
         LineInfo::FullLine { text, .. } => {
             *text = normalize_text(&main_replacement);

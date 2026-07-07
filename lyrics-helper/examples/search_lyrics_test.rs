@@ -1,5 +1,5 @@
 use lyrics_helper::models::{LyricsRawTypes, TrackMetadata};
-use lyrics_helper::search::providers::web::{kugou, lrclib, musixmatch, netease, qq_music};
+use lyrics_helper::search::providers::web::{kugou, lrclib, musixmatch, netease, qq_music, soda_music};
 use lyrics_helper::searchers::apple_music::AppleMusicSearcher;
 use lyrics_helper::searchers::kugou::KugouSearcher;
 use lyrics_helper::searchers::lrclib::LRCLIBSearcher;
@@ -145,6 +145,24 @@ async fn main() {
                             })
                     }
                     None => None,
+                }
+            }
+            Searchers::SodaMusic => {
+                match soda_music::api::get_lyrics(&r.id).await {
+                    Some((lyric, trans)) => {
+                        if let Some(ref t) = trans {
+                            let preview: Vec<&str> = t.lines().take(3).collect();
+                            for line in &preview {
+                                println!("  [译] {}", line);
+                            }
+                        }
+                        lyric
+                    }
+                    None => {
+                        println!("  ❌ 获取歌词失败");
+                        println!();
+                        continue;
+                    }
                 }
             }
             _ => {
